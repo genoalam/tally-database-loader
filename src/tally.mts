@@ -1431,9 +1431,12 @@ class _tally {
                         }
 
                     } else if (isParsingCollection && /^\<\/[A-Z]+\.LIST\>$/g.test(line)) { //check if line is end of sub-list
-                        isParsingSubList = false; //reset sub-list flag
-                        isParsingArrayList = false; //reset array list flag
-                        lstPathTree.pop(); //pop from path tree
+                        if (isParsingArrayList) {
+                            isParsingArrayList = false; //reset array list flag
+                        } else {
+                            isParsingSubList = false; //reset sub-list flag
+                            lstPathTree.pop(); //pop from path tree
+                        }
                     } else;
 
                 });

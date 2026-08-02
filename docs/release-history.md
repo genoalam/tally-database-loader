@@ -1,5 +1,11 @@
 ## Release History
 
+**Version: 1.0.44 [02-Aug-2026]**<br>
+
+Fixed:
+* Array list in the Tally collection as sub-list corrupted collection object as reported in [#61](https://github.com/dhananjay1405/tally-database-loader/issues/61) is now fixed
+* PostgreSQL string data type does not require text length, which is removed from database-structure
+
 **Version: 1.0.43 [05-May-2026]**<br>
 
 Fixed:
