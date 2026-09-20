@@ -3,12 +3,13 @@
 -- Existing mst_* / trn_* columns stay; every table gains slice_id.
 
 create table legal_entity (
-    id              uuid primary key,
-    name            text not null,
-    canonical_name  text not null,
-    gstn            text,
-    pan             text,
-    created_at      timestamptz not null default now()
+    id                          uuid primary key,
+    name                        text not null,
+    canonical_name              text not null,
+    gstn                        text,
+    pan                         text,
+    last_name_propagated_at     timestamptz,
+    created_at                  timestamptz not null default now()
 );
 
 create table company_slice (
@@ -26,6 +27,8 @@ create table company_slice (
 );
 
 create unique index uq_slice_tally_name on company_slice (entity_id, tally_name);
+create unique index uq_slice_current on company_slice (entity_id) where is_current;
+create index ix_slice_entity_books on company_slice (entity_id, books_to desc);
 
 create table sync_state (
     slice_id                    uuid primary key references company_slice (id),
@@ -114,14 +117,27 @@ create table trn_accounting (
 
 create index ix_trn_accounting_slice_voucher on trn_accounting (slice_id, guid);
 create index ix_trn_accounting_slice_ledger on trn_accounting (slice_id, _ledger);
+create index ix_mst_ledger_guid on mst_ledger (guid);
 
--- Cross-year reporting: names come from identity, amounts from the slice that owns the voucher.
+-- Latest name per GUID: current slice wins; else newest books_to that still has the GUID.
+-- AlterID is not comparable across Tally companies.
+create or replace view v_latest_ledger as
+select distinct on (s.entity_id, l.guid)
+    s.entity_id,
+    l.guid,
+    l.name,
+    l.slice_id as winner_slice_id
+from mst_ledger l
+join company_slice s on s.id = l.slice_id
+order by s.entity_id, l.guid, s.is_current desc, s.books_to desc nulls last, l.alterid desc;
+
+-- After Phase B rewrite, slice-local names match the winner. GUID remains the join key.
 create or replace view v_accounting as
 select
     s.entity_id,
     a.slice_id,
     v.date,
-    coalesce(i.canonical_name, l.name) as ledger,
+    a.ledger,
     a.amount,
     v.voucher_number,
     v.is_order_voucher,
@@ -130,8 +146,4 @@ from trn_accounting a
 join trn_voucher v
     on v.slice_id = a.slice_id and v.guid = a.guid
 join company_slice s
-    on s.id = a.slice_id
-left join mst_ledger l
-    on l.slice_id = a.slice_id and l.guid = a._ledger
-left join master_identity i
-    on i.id = l.identity_id;
+    on s.id = a.slice_id;

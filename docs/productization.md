@@ -327,7 +327,7 @@ mst_ledger  PK (slice_id, guid)
 trn_accounting  (slice_id, guid, _ledger, amount, ...)
 ```
 
-Reports **must** join `trn_accounting._ledger` → `mst_ledger.guid` **and** `slice_id`, then optionally fold to `master_identity` for cross-year names. Stop joining on `ledger` name for warehouse queries.
+Warehouse joins use `trn_accounting._ledger` → GUID **and** `slice_id`. After Phase B, name columns match the latest master, so Excel / Power BI grouping by `ledger` stays correct across years.
 
 ### 4.4 How a split year is ingested
 
@@ -358,10 +358,10 @@ All of these are in `src/tally.mts` / `src/database.mts`:
 1. Stop truncating `config`. Use `sync_state` keyed by `slice_id`.
 2. Stamp every extracted row with `slice_id` before bulk load (CSV extra column, or `ALTER TABLE` default + session setting).
 3. Scope `_diff` / `_delete` comparisons: `guid not in _diff` **and** `slice_id = current`.
-4. Scope cascade_update / cascade_delete with `slice_id`.
+4. Scope cascade_update / cascade_delete with **both** `guid` and `slice_id` (Phase A). Never join child → master on `guid` alone.
 5. Do not treat a reused master GUID from another slice as a collision; PK includes `slice_id`.
 6. Keep `_diff` / `_delete` / `_vchnumber` global staging tables but always truncated and filled for one slice at a time (single-writer queue).
-7. After master import, run the identity matcher for that slice only.
+7. After a **current-slice** master import, run `propagate_latest_master_names(entity_id)` (Phase B) so frozen years pick up the new names. See [master-name-propagation.md](master-name-propagation.md).
 
 Until those exist, loading a second company into the same schema will either unique-key-fail or silently delete the first company’s rows.
 
@@ -369,68 +369,51 @@ Until those exist, loading a second company into the same schema will either uni
 
 ## 5. Master names that have changed
 
-Tally stores the **current** master name on vouchers. It does not keep a historical name on each voucher. The incremental YAML already encodes that fact as `cascade_update`.
+**Locked:** rewrite older slices from the latest master. Identity is GUID. Full algorithm: [master-name-propagation.md](master-name-propagation.md).
 
-### 5.1 What happens today (single company)
+Tally stores the **current** master name on vouchers. Incremental YAML already rewrites child name columns via `cascade_update` inside one company. Across split companies that join is unsafe: two `mst_ledger` rows can share a GUID, so `join on guid` is 1:N.
 
-1. User renames ledger `Cash` → `Cash in Hand` in Tally.
-2. Master `AlterID` increases; voucher AlterIDs may not.
-3. Incremental re-imports the ledger row (new `name`, same `guid`).
-4. `cascade_update` rewrites `trn_accounting.ledger`, `trn_bill.ledger`, and the rest to `Cash in Hand`.
-5. Reports that join on name keep working **inside that company**.
+### 5.1 Safety fix (two phases)
 
-This does **not** work across split companies:
-
-- Slice A still has name `Cash` on its frozen rows (until someone incremental-syncs A, which they usually cannot, because that Tally file is archived).
-- Slice B has `Cash in Hand`.
-- `UNION ALL` of `trn_accounting` grouped by `ledger` splits one account into two.
-
-### 5.2 Resolution policy
-
-| Signal | Confidence | Action |
-| --- | --- | --- |
-| Same Tally GUID in parent and child slice | High | Auto-link `master_identity` |
-| Same GSTIN / PAN / bank account, different GUID | High for parties | Auto-link, flag for review |
-| Exact alias match (`mst_ledger.alias`) | Medium | Auto-link if unique |
-| Normalized name (trim, case, punctuation) | Low | Suggest, do not auto-link |
-| User maps in UI | Authoritative | Always wins |
-
-Store **canonical_name** on `master_identity` (editable). Keep slice-local `name` untouched so a re-sync from Tally cannot clobber the canonical label.
-
-Reporting views:
+**Phase A (hot path, current slice only).** Add `slice_id` to every cascade join:
 
 ```sql
-create view v_accounting as
-select
-  s.entity_id,
-  v.date,
-  coalesce(i.canonical_name, l.name) as ledger,
-  a.amount,
-  v.is_order_voucher,
-  v.is_inventory_voucher
-from trn_accounting a
-join trn_voucher v
-  on v.slice_id = a.slice_id and v.guid = a.guid
-join company_slice s
-  on s.id = a.slice_id
-join mst_ledger l
-  on l.slice_id = a.slice_id and l.guid = a._ledger
-left join master_identity i
-  on i.id = l.identity_id;
+update t set t.ledger = s.name
+from trn_accounting as t
+join mst_ledger as s
+  on s.guid = t._ledger
+ and s.slice_id = t.slice_id
+where t.slice_id = @current_slice_id;
 ```
 
-Group-by for a 3-year P&amp;L uses `ledger` from this view, not the raw Tally name.
+Deletes are also `slice_id = current`. A GUID missing in this year’s Tally file must not delete last year’s rows.
 
-### 5.3 Groups, UOM, godowns, voucher types
+**Phase B (low frequency, whole entity).** After a current-slice master sync, pick one winner name per GUID and stamp it on every slice:
 
-The same rename problem exists for every name-typed foreign key. Incremental YAML already lists them under `cascade_update` (`mst_group.parent`, `mst_stock_item.uom`, `trn_voucher.voucher_type`, …). The warehouse matcher needs one `master_type` per collection, not only ledgers.
+1. Prefer the **current** slice’s master row if that GUID still exists there.
+2. Else the slice with the latest `books_to` that still has the GUID.
+3. Do **not** use `alterid` or `last_sync_at` across slices (`alterid` is per Tally company; a rare historical reload would look “newest” and regress names).
 
-### 5.4 What not to do
+Then rewrite frozen `mst_*.name` and all child name copies (`trn_accounting.ledger`, `trn_voucher.party_name`, …) where `_guid` matches. Skip rows whose name is already equal. Keep GUID columns and balances untouched.
 
-- Do not overwrite historical slice names during a current-year sync.
-- Do not join reports on `name` once two slices exist.
-- Do not delete a master in slice B because it is absent in slice A’s `_diff`.
-- Do not assume GUID equality when a company was **recreated** instead of Split (GUIDs will be new; mapping UI is mandatory).
+A historical reload is allowed: load that slice (Phase A), then immediately run Phase B from **current** winners so old Tally names cannot stick.
+
+### 5.2 GUID merge vs name map
+
+| Signal | Action |
+| --- | --- |
+| Same Tally GUID across slices | Auto-link. Phase B supplies the name. No mapping UI. |
+| GUID missing in current, present in history | Keep last winner name (newest `books_to`). Do not delete history. |
+| Different GUIDs (company recreated) | GSTIN / alias / manual map. GUID-only cannot merge these. |
+
+`master_identity.canonical_name` is written from the Phase B winner. `master_alias` records the previous slice-local label when a rewrite happens.
+
+### 5.3 What not to do
+
+- Do not join child → master on `guid` without `slice_id` (Phase A) or without a winner set (Phase B).
+- Do not delete frozen-slice masters because they are absent from the current company’s `_diff`.
+- Do not let a frozen-slice sync drive Phase B winners.
+- Do not assume GUID equality when a company was **recreated** instead of Split.
 
 ---
 
@@ -462,7 +445,7 @@ Work is ordered by dependency, not by calendar.
 1. **Warehouse identity** — `legal_entity`, `company_slice`, `sync_state`; add `slice_id` to every table; composite keys; views that restore today’s single-company report SQL.
 2. **Scoped incremental** — filter `_diff` / `_delete` / cascade SQL by `slice_id`; stop truncating global `config`.
 3. **Ingest second slice** — register split, full load without wiping slice 1; prove trial balance per slice.
-4. **Master matcher + mapping UI** — GUID / GSTIN / alias / manual; reporting views use `canonical_name`.
+4. **Phase B name rewrite** — `propagate_latest_master_names`; mapping UI only for non-matching GUIDs.
 5. **Product UI** — wizard, timeline, job console, log drawer; retire `gui.html` as the primary surface.
 6. **JSON incremental** — reuse collection extractor with AlterID filters so large current-year companies stay fast.
 7. **Hardening** — single-writer job queue, Tally-not-open handling (already partially present), backup-before-full-sync.
@@ -483,14 +466,14 @@ Step 1–4 are the actual product. Step 5 without 1–4 is a prettier way to cor
 | GUI / local server | `gui.html`, `src/server.mts` |
 | Multi-company today | `platform/powershell/sync-multiple-company.ps1`, `docs/commandline-options.md` |
 | Split openings | `mst_opening_bill_allocation`, `mst_opening_batch_allocation`, `reports/*/bills-*.sql` |
-| Name-based ER | `docs/data-structure.md` |
+| Name rewrite across slices | `docs/master-name-propagation.md`, `platform/postgresql/propagate-latest-master-names.sql`, `platform/mssql/propagate-latest-master-names.sql` |
 
 ---
 
 ## 8. Decisions to lock before implementation
 
 1. **PostgreSQL first** for the multi-slice warehouse (JSON matcher state, cheaper updates). Keep SQL Server as a second target; do not start with BigQuery.
-2. **GUID-first identity**, names as attributes. Canonical name is user-editable.
+2. **GUID-first identity.** Latest master name (current slice) is rewritten onto older slices. Canonical name follows that winner.
 3. **One writer** to a warehouse at a time (queue). Tally XML is not safe for parallel companies on one Prime instance anyway.
-4. Historical slices are **immutable by default**. Incremental is for the current open company.
-5. Reports ship as views in the warehouse so Excel / Power BI keep working without the UI.
+4. Historical slices are **frozen for Tally edits and deletes**. Names are rewritten from the current master after each current-slice master sync, and again after a rare historical reload.
+5. Reports can keep grouping by name after Phase B. Joins for warehouse logic still use GUID + `slice_id`.

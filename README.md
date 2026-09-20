@@ -24,6 +24,7 @@ Commandline utility to load data into Database Server from Tally software, inten
 * [Understanding Database Structure](docs/data-structure.md)
 * [Incremental / Full Sync](docs/incremental-sync.md)
 * [Productization: multi-company warehouse and UI](docs/productization.md)
+* [Master name rewrite across split companies](docs/master-name-propagation.md)
 * [Tally Export Config](#tally-export-config)
 * [Commandline Options](docs/commandline-options.md)
 * [Logs](#logs)
